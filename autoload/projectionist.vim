@@ -370,9 +370,27 @@ function! s:expand_placeholders(value, expansions, ...) abort
   return !a:0 && value =~# "[\001-\006\016-\037]" ? '' : value
 endfunction
 
-let s:valid_key = '^\%([^*{}]*\*\*[^*{}]\{2\}\)\=[^*{}]*\*\=[^*{}]*$'
+" test if pattern has backref like {1} or * followed by * (or **)
+let s:valid_backref_key = '{\d}\|\v(^|[^*])\*[^*]+\*'
+let s:valid_nobackref_key = '^\%([^*{}]*\*\*[^*{}]\{2\}\)\=[^*{}]*\*\=[^*{}]*$'
+let s:valid_key = s:valid_nobackref_key . '\|' . s:valid_backref_key
 
 function! s:match(file, pattern) abort
+  if a:pattern =~# s:valid_backref_key
+    let pattern = s:slash(a:pattern)
+    let file = s:slash(a:file)
+    let regex = substitute(pattern, '\*\*\/\=', "\x01", 'g')
+    let regex = substitute(regex, '\*', '\\v([^/]*)\\V', 'g')
+    let regex = substitute(regex, "\x01", '\\v(.{-})/=\\V', 'g')
+    let regex = substitute(regex, '{\(\d\)}', '\\\1', 'g')
+    let matches = matchlist(file, '\V\^' . regex . '\$')
+    if !empty(matches)
+      return join(filter(matches[1:], 'v:val !=# ""'), '/')
+    else
+      return ''
+    endif
+  endif
+  
   if a:pattern =~# '^[^*{}]*\*[^*{}]*$'
     let pattern = s:slash(substitute(a:pattern, '\*', '**/*', ''))
   elseif a:pattern =~# '^[^*{}]*\*\*[^*{}]\+\*[^*{}]*$'
@@ -760,8 +778,9 @@ endfunction
 function! s:open_projection(mods, edit, variants, ...) abort
   let formats = []
   for variant in a:variants
-    call add(formats, variant[0] . projectionist#slash() . (variant[1] =~# '\*\*'
-          \ ? variant[1] : substitute(variant[1], '\*', '**/*', '')))
+    call add(formats, s:slash(variant[0] . projectionist#slash() . (variant[1] =~# '\*\*'
+          \ || variant[1] =~# s:valid_backref_key
+          \ ? variant[1] : substitute(variant[1], '\*', '**/*', ''))))
   endfor
   let cmd = s:parse(a:mods, a:000)
   if get(cmd.args, -1, '') ==# '`=`'
@@ -771,9 +790,58 @@ function! s:open_projection(mods, edit, variants, ...) abort
   if len(cmd.args)
     call filter(formats, 'v:val =~# "\\*"')
     let name = s:slash(join(cmd.args, ' '))
-    let dir = matchstr(name, '.*\ze/')
-    let base = substitute(name, '.*/', '', '')
-    call map(formats, 'substitute(substitute(v:val, "\\*\\*\\(/\\=\\)", empty(dir) ? "" : dir . "\\1", ""), "\\*", base, "")')
+    let mod_formats = []
+    for format in formats
+      if format =~# s:valid_backref_key
+        " match name=a/b/c with format=*/**/*
+        " by matching */** groups and fixed text around them
+        " i.e. fixed[0] . group[0] . fixed[1] ...
+
+        " Find fixed text parts around the * ** groups
+        let fixed = split(format, '\*\*/\=', 1)
+        let num_double = len(fixed) - 1
+        if num_double > 1
+            return 'echoerr "Only up to one ** group is allowed"'
+        endif
+        let fixed = split(fixed[0], '\*', 1) + fixed[1:]
+        let i_double = len(fixed) - num_double - 1
+        if num_double > 0
+            let fixed = fixed[:-2] + split(fixed[-1], '\*', 1)
+        endif
+
+        let groups = split(name, '/')
+        let n_extra = len(groups) - (len(fixed)-1) + num_double
+        if num_double == 0
+          if n_extra != 0
+            continue " not enough segments to match
+          endif
+        else
+          " for **, regroup the groups assuming ** matches 0-n segments
+          if n_extra < 0
+            continue " not enough segments to match
+          elseif n_extra == 0
+            let groups = (i_double > 0 ? groups[:i_double-1] : []) + [''] + groups[i_double:]
+          else
+            let groups = (i_double > 0 ? groups[:i_double-1] : []) +
+              \ [join(groups[i_double : i_double+n_extra-1], '/') . '/'] +
+              \ groups[i_double+n_extra : ]
+          endif
+        endif
+        " reconstruct the name with the new groups
+        let f = fixed[0]
+        for i in range(len(fixed) - 1)
+          let f .= groups[i] . fixed[i+1]
+        endfor
+        " handle backrefs like {1}
+        let f = substitute(f, '{\(\d\)}', '\=groups[submatch(1)-1]', 'g')
+      else " handle original format with ** and *
+        let dir = matchstr(name, '.*\ze/')
+        let base = substitute(name, '.*/', '', '')
+        let f = substitute(substitute(format, "\\*\\*\\(/\\=\\)", empty(dir) ? "" : dir . "\\1", ""), "\\*", base, "")
+      endif
+      call add(mod_formats, f)
+    endfor
+    let formats = mod_formats
   else
     let related_file = s:find_related_file(formats)
     if !empty(related_file)
@@ -805,6 +873,7 @@ function! s:projection_complete(lead, cmdline, _) abort
       continue
     endif
     let glob = substitute(format, '[^/]*\ze\*\*/\*', '', 'g')
+    let glob = substitute(glob, '{\d}', '*', 'g')
     let results += map(projectionist#glob(glob), 's:match(v:val, format)')
   endfor
   call s:uniq(results)

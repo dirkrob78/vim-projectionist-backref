@@ -67,7 +67,6 @@ endfunction
 function! projectionist#json_parse(string) abort
   let string = type(a:string) == type([]) ? join(a:string, ' ') : a:string
   if exists('*json_decode')
-    try
       return json_decode(string)
     catch
     endtry
